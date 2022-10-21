@@ -16,42 +16,42 @@
 
 package org.springframework.graphql.data;
 
-import java.lang.reflect.Constructor;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Stack;
-import java.util.function.Consumer;
-
 import graphql.schema.DataFetchingEnvironment;
-
-import org.springframework.beans.BeanInstantiationException;
-import org.springframework.beans.BeanUtils;
-import org.springframework.beans.MutablePropertyValues;
-import org.springframework.beans.SimpleTypeConverter;
-import org.springframework.beans.TypeMismatchException;
+import org.springframework.beans.*;
 import org.springframework.core.CollectionFactory;
+import org.springframework.core.Conventions;
+import org.springframework.core.MethodParameter;
 import org.springframework.core.ResolvableType;
 import org.springframework.core.convert.ConversionService;
 import org.springframework.core.convert.TypeDescriptor;
 import org.springframework.lang.Nullable;
+import org.springframework.util.ClassUtils;
+import org.springframework.validation.AbstractBindingResult;
 import org.springframework.validation.BindException;
-import org.springframework.validation.BindingErrorProcessor;
-import org.springframework.validation.BindingResult;
-import org.springframework.validation.DataBinder;
-import org.springframework.validation.DefaultBindingErrorProcessor;
 import org.springframework.validation.FieldError;
+
+import java.lang.reflect.Constructor;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Optional;
 
 
 /**
  * Bind a GraphQL argument, or the full arguments map, onto a target object.
  *
- * <p>Binding is performed by mapping argument values to a primary data
- * constructor of the target object, or by using a default constructor and
- * mapping argument values to its properties. This is applied recursively.
+ * <p>Complex objects (non-scalar) are initialized either through the primary
+ * data constructor where arguments are matched to constructor parameters, or
+ * through the default constructor where arguments are matched to setter
+ * property methods. In case objects are related to other objects, binding is
+ * applied recursively to create nested objects.
+ *
+ * <p>Scalar values are converted to the expected target type through a
+ * {@link ConversionService}, if provided.
+ *
+ * <p>In case of any errors, when creating objects or converting scalar values,
+ * a {@link BindException} is raised that contains all errors recorded along
+ * with the path at which the errors occurred.
  *
  * @author Brian Clozel
  * @author Rossen Stoyanchev
@@ -59,18 +59,8 @@ import org.springframework.validation.FieldError;
  */
 public class GraphQlArgumentBinder {
 
-	/**
-	 * Use a larger {@link DataBinder#DEFAULT_AUTO_GROW_COLLECTION_LIMIT} for GraphQL use cases
-	 */
-	private static final int DEFAULT_AUTO_GROW_COLLECTION_LIMIT = 1024;
-
-
 	@Nullable
 	private final SimpleTypeConverter typeConverter;
-
-	private final BindingErrorProcessor bindingErrorProcessor = new DefaultBindingErrorProcessor();
-
-	private final List<Consumer<DataBinder>> dataBinderInitializers = new ArrayList<>();
 
 
 	public GraphQlArgumentBinder() {
@@ -86,25 +76,6 @@ public class GraphQlArgumentBinder {
 			//  Not thread-safe when using PropertyEditors
 			this.typeConverter = null;
 		}
-	}
-
-
-	private SimpleTypeConverter getTypeConverter() {
-		return (this.typeConverter != null ? this.typeConverter : new SimpleTypeConverter());
-	}
-
-	@Nullable
-	private ConversionService getConversionService() {
-		return (this.typeConverter != null ? this.typeConverter.getConversionService() : null);
-	}
-
-	/**
-	 * Add a {@link DataBinder} consumer that initializes the binder instance before the binding process.
-	 * @param dataBinderInitializer the data binder initializer
-	 * @since 1.0.1
-	 */
-	public void addDataBinderInitializer(Consumer<DataBinder> dataBinderInitializer) {
-		this.dataBinderInitializers.add(dataBinderInitializer);
 	}
 
 
@@ -127,42 +98,48 @@ public class GraphQlArgumentBinder {
 			DataFetchingEnvironment environment, @Nullable String name, ResolvableType targetType)
 			throws BindException {
 
-		Object rawValue = (name != null ?
-				environment.getArgument(name) : environment.getArguments());
+		Object rawValue = (name != null ? environment.getArgument(name) : environment.getArguments());
+		boolean isOmitted = (name != null && !environment.getArguments().containsKey(name));
 
-		DataBinder binder = new DataBinder(null, name != null ? ("Arguments[" + name + "]") : "Arguments");
-		initDataBinder(binder);
-		BindingResult bindingResult = binder.getBindingResult();
+		ArgumentsBindingResult bindingResult = new ArgumentsBindingResult(targetType);
 
-		Stack<String> segments = new Stack<>();
-		if (name != null) {
-			segments.push(name);
-		}
-
-		Object targetValue = bindRawValue(
-				rawValue, targetType, targetType.resolve(Object.class), bindingResult, segments);
+		Object value = bindRawValue(
+				"$", rawValue, isOmitted, targetType, targetType.resolve(Object.class), bindingResult);
 
 		if (bindingResult.hasErrors()) {
 			throw new BindException(bindingResult);
 		}
 
-		return targetValue;
+		return value;
 	}
 
-	private void initDataBinder(DataBinder binder) {
-		binder.setAutoGrowCollectionLimit(DEFAULT_AUTO_GROW_COLLECTION_LIMIT);
-		this.dataBinderInitializers.forEach(initializer -> initializer.accept(binder));
-	}
-
+	/**
+	 * Bind the raw GraphQL argument value to an Object of the specified type.
+	 * @param name the name of a constructor parameter or a bean property of the
+	 * target Object that is to be initialized from the given raw value;
+	 * {@code "$"} if binding the top level Object; possibly indexed if binding
+	 * to a Collection element or to a Map value.
+	 * @param rawValue the raw argument value (Collection, Map, or scalar)
+	 * @param isOmitted whether the value with the given name was not provided
+	 * at all, as opposed to provided but set to the {@literal "null"} literal
+	 * @param targetType the type of Object to create
+	 * @param targetClass the resolved class from the targetType
+	 * @param bindingResult for keeping track of the nested path and errors
+	 * @return the target Object instance, possibly {@code null} if the source
+	 * value is {@code null} or if binding failed in which case the result will
+	 * contain errors; nevertheless we keep going to record as many errors as
+	 * we can accumulate
+	 */
 	@SuppressWarnings({"ConstantConditions", "unchecked"})
 	@Nullable
 	private Object bindRawValue(
-			Object rawValue, ResolvableType targetType, Class<?> targetClass,
-			BindingResult bindingResult, Stack<String> segments) {
+			String name, @Nullable Object rawValue, boolean isOmitted,
+			ResolvableType targetType, Class<?> targetClass, ArgumentsBindingResult bindingResult) {
 
 		boolean isOptional = (targetClass == Optional.class);
+		boolean isArgumentValue = (targetClass == ArgumentValue.class);
 
-		if (isOptional) {
+		if (isOptional || isArgumentValue) {
 			targetType = targetType.getNested(2);
 			targetClass = targetType.resolve();
 		}
@@ -172,27 +149,34 @@ public class GraphQlArgumentBinder {
 			value = rawValue;
 		}
 		else if (rawValue instanceof Collection) {
-			value = bindCollection((Collection<Object>) rawValue, targetType, targetClass, bindingResult, segments);
+			value = bindCollection(name, (Collection<Object>) rawValue, targetType, targetClass, bindingResult);
 		}
 		else if (rawValue instanceof Map) {
-			value = bindMap((Map<String, Object>) rawValue, targetType, targetClass, bindingResult, segments);
+			value = bindMap(name, (Map<String, Object>) rawValue, targetType, targetClass, bindingResult);
 		}
 		else {
 			value = (targetClass.isAssignableFrom(rawValue.getClass()) ?
-					rawValue : convertValue(rawValue, targetClass, bindingResult, segments));
+					rawValue : convertValue(name, rawValue, targetClass, bindingResult));
 		}
 
-		return (isOptional ? Optional.ofNullable(value) : value);
+		if (isOptional) {
+			value = Optional.ofNullable(value);
+		}
+		else if (isArgumentValue) {
+			value = (isOmitted ? ArgumentValue.omitted() : ArgumentValue.ofNullable(value));
+		}
+
+		return value;
 	}
 
 	private Collection<?> bindCollection(
-			Collection<Object> rawCollection, ResolvableType collectionType, Class<?> collectionClass,
-			BindingResult bindingResult, Stack<String> segments) {
+			String name, Collection<Object> rawCollection, ResolvableType collectionType, Class<?> collectionClass,
+			ArgumentsBindingResult bindingResult) {
 
 		ResolvableType elementType = collectionType.asCollection().getGeneric(0);
 		Class<?> elementClass = collectionType.asCollection().getGeneric(0).resolve();
 		if (elementClass == null) {
-			bindingResult.rejectValue(toArgumentPath(segments), "unknownTargetType", "Unknown target type");
+			bindingResult.rejectValue(null, "unknownType", "Unknown Collection element type");
 			return Collections.emptyList(); // Keep going, report as many errors as we can
 		}
 
@@ -201,63 +185,43 @@ public class GraphQlArgumentBinder {
 
 		int index = 0;
 		for (Object rawValue : rawCollection) {
-			segments.push("[" + index++ + "]");
-			collection.add(bindRawValue(rawValue, elementType, elementClass, bindingResult, segments));
-			segments.pop();
+			String indexedName = name + "[" + index++ + "]";
+			collection.add(bindRawValue(indexedName, rawValue, false, elementType, elementClass, bindingResult));
 		}
 
 		return collection;
 	}
 
-	private static String toArgumentPath(Stack<String> path) {
-		StringBuilder sb = new StringBuilder();
-		path.forEach(sb::append);
-		return sb.toString();
-	}
-
 	@Nullable
 	private Object bindMap(
-			Map<String, Object> rawMap, ResolvableType targetType, Class<?> targetClass,
-			BindingResult bindingResult, Stack<String> segments) {
+			String name, Map<String, Object> rawMap, ResolvableType targetType, Class<?> targetClass,
+			ArgumentsBindingResult bindingResult) {
 
 		if (Map.class.isAssignableFrom(targetClass)) {
-			return bindMapToMap(rawMap, targetType, bindingResult, segments, targetClass);
+			return bindMapToMap(name, rawMap, targetType, targetClass, bindingResult);
 		}
+
+		bindingResult.pushNestedPath(name);
 
 		Constructor<?> constructor = BeanUtils.getResolvableConstructor(targetClass);
-		if (constructor.getParameterCount() > 0) {
-			return bindMapToObjectViaConstructor(rawMap, constructor, bindingResult, segments);
-		}
 
-		Object target = BeanUtils.instantiateClass(constructor);
-		DataBinder dataBinder = new DataBinder(target);
-		initDataBinder(dataBinder);
-		dataBinder.getBindingResult().setNestedPath(toArgumentPath(segments));
-		dataBinder.setConversionService(getConversionService());
-		dataBinder.bind(createPropertyValues(rawMap));
+		Object value = constructor.getParameterCount() > 0 ?
+				bindMapToObjectViaConstructor(rawMap, constructor, bindingResult) :
+				bindMapToObjectViaSetters(rawMap, constructor, bindingResult);
 
-		if (dataBinder.getBindingResult().hasErrors()) {
-			String nestedPath = dataBinder.getBindingResult().getNestedPath();
-			for (FieldError error : dataBinder.getBindingResult().getFieldErrors()) {
-				bindingResult.addError(
-						new FieldError(bindingResult.getObjectName(), nestedPath + error.getField(),
-								error.getRejectedValue(), error.isBindingFailure(), error.getCodes(),
-								error.getArguments(), error.getDefaultMessage()));
-			}
-			return null;
-		}
+		bindingResult.popNestedPath();
 
-		return target;
+		return value;
 	}
 
 	private Map<?, Object> bindMapToMap(
-			Map<String, Object> rawMap, ResolvableType targetType, BindingResult bindingResult,
-			Stack<String> segments, Class<?> targetClass) {
+			String name, Map<String, Object> rawMap, ResolvableType targetType, Class<?> targetClass,
+			ArgumentsBindingResult bindingResult) {
 
 		ResolvableType valueType = targetType.asMap().getGeneric(1);
 		Class<?> valueClass = valueType.resolve();
 		if (valueClass == null) {
-			bindingResult.rejectValue(toArgumentPath(segments), "unknownTargetType", "Unknown target type");
+			bindingResult.rejectValue(null, "unknownType", "Unknown Map value type");
 			return Collections.emptyMap(); // Keep going, report as many errors as we can
 		}
 
@@ -265,9 +229,8 @@ public class GraphQlArgumentBinder {
 
 		for (Map.Entry<String, Object> entry : rawMap.entrySet()) {
 			String key = entry.getKey();
-			segments.push("[" + key + "]");
-			map.put(key, bindRawValue(entry.getValue(), valueType, valueClass, bindingResult, segments));
-			segments.pop();
+			String indexedName = name + "[" + key + "]";
+			map.put(key, bindRawValue(indexedName, entry.getValue(), false, valueType, valueClass, bindingResult));
 		}
 
 		return map;
@@ -275,12 +238,7 @@ public class GraphQlArgumentBinder {
 
 	@Nullable
 	private Object bindMapToObjectViaConstructor(
-			Map<String, Object> rawMap, Constructor<?> constructor, BindingResult bindingResult,
-			Stack<String> segments) {
-
-		if (segments.size() > 0) {
-			segments.push(".");
-		}
+			Map<String, Object> rawMap, Constructor<?> constructor, ArgumentsBindingResult bindingResult) {
 
 		String[] paramNames = BeanUtils.getParameterNames(constructor);
 		Class<?>[] paramTypes = constructor.getParameterTypes();
@@ -288,14 +246,9 @@ public class GraphQlArgumentBinder {
 
 		for (int i = 0; i < paramNames.length; i++) {
 			String name = paramNames[i];
-			segments.push(name);
+			boolean isOmitted = !rawMap.containsKey(name);
 			ResolvableType paramType = ResolvableType.forConstructorParameter(constructor, i);
-			args[i] = bindRawValue(rawMap.get(name), paramType, paramTypes[i], bindingResult, segments);
-			segments.pop();
-		}
-
-		if (segments.size() > 1) {
-			segments.pop();
+			args[i] = bindRawValue(name, rawMap.get(name), isOmitted, paramType, paramTypes[i], bindingResult);
 		}
 
 		try {
@@ -310,61 +263,90 @@ public class GraphQlArgumentBinder {
 		}
 	}
 
-	private static MutablePropertyValues createPropertyValues(Map<String, Object> rawMap) {
-		MutablePropertyValues mpvs = new MutablePropertyValues();
-		Stack<String> segments = new Stack<>();
-		for (String key : rawMap.keySet()) {
-			addPropertyValue(mpvs, key, rawMap.get(key), segments);
-		}
-		return mpvs;
-	}
+	private Object bindMapToObjectViaSetters(
+			Map<String, Object> rawMap, Constructor<?> constructor, ArgumentsBindingResult bindingResult) {
 
-	@SuppressWarnings("unchecked")
-	private static void addPropertyValue(MutablePropertyValues mpvs, String name, Object value, Stack<String> segments) {
-		if (value instanceof List) {
-			List<Object> items = (List<Object>) value;
-			if (items.isEmpty()) {
-				segments.push(name);
-				mpvs.add(toArgumentPath(segments), value);
-				segments.pop();
+		Object target = BeanUtils.instantiateClass(constructor);
+		BeanWrapper beanWrapper = PropertyAccessorFactory.forBeanPropertyAccess(target);
+
+		for (Map.Entry<String, Object> entry : rawMap.entrySet()) {
+			String key = entry.getKey();
+			TypeDescriptor type = beanWrapper.getPropertyTypeDescriptor(key);
+			if (type == null) {
+				// Ignore unknown property
+				continue;
 			}
-			else {
-				for (int i = 0; i < items.size(); i++) {
-					addPropertyValue(mpvs, name + "[" + i + "]", items.get(i), segments);
+			Object value = bindRawValue(
+					key, entry.getValue(), false, type.getResolvableType(), type.getType(), bindingResult);
+			try {
+				if (value != null) {
+					beanWrapper.setPropertyValue(key, value);
 				}
 			}
-		}
-		else if (value instanceof Map) {
-			segments.push(name + ".");
-			Map<String, Object> map = (Map<String, Object>) value;
-			for (String key : map.keySet()) {
-				addPropertyValue(mpvs, key, map.get(key), segments);
+			catch (NotWritablePropertyException ex) {
+				// Ignore unknown property
 			}
-			segments.pop();
+			catch (Exception ex) {
+				bindingResult.rejectValue(value, "invalidPropertyValue", "Failed to set property value");
+			}
 		}
-		else {
-			segments.push(name);
-			mpvs.add(toArgumentPath(segments), value);
-			segments.pop();
-		}
+
+		return target;
 	}
 
 	@SuppressWarnings("unchecked")
 	@Nullable
 	private <T> T convertValue(
-			@Nullable Object rawValue, Class<T> type, BindingResult bindingResult, Stack<String> segments) {
+			String name, @Nullable Object rawValue, Class<T> type, ArgumentsBindingResult bindingResult) {
 
 		Object value = null;
 		try {
-			value = getTypeConverter().convertIfNecessary(rawValue, (Class<?>) type, TypeDescriptor.valueOf(type));
+			TypeConverter converter = (this.typeConverter != null ? this.typeConverter : new SimpleTypeConverter());
+			value = converter.convertIfNecessary(rawValue, (Class<?>) type);
 		}
 		catch (TypeMismatchException ex) {
-			String name = toArgumentPath(segments);
-			ex.initPropertyName(name);
-			bindingResult.recordFieldValue(name, type, rawValue);
-			this.bindingErrorProcessor.processPropertyAccessException(ex, bindingResult);
+			bindingResult.pushNestedPath(name);
+			bindingResult.rejectValue(rawValue, ex.getErrorCode(), "Failed to convert argument value");
+			bindingResult.popNestedPath();
 		}
 		return (T) value;
+	}
+
+
+	/**
+	 * BindingResult without a target Object, only for keeping track of errors
+	 * and their associated, nested paths.
+	 */
+	private static class ArgumentsBindingResult extends AbstractBindingResult {
+
+		ArgumentsBindingResult(ResolvableType targetType) {
+			super(initObjectName(targetType));
+		}
+
+        private static String initObjectName(ResolvableType targetType) {
+            if (targetType.getSource() instanceof MethodParameter) {
+                MethodParameter methodParameter = (MethodParameter) targetType.getSource();
+                return Conventions.getVariableNameForParameter(methodParameter);
+            } else {
+                return ClassUtils.getShortNameAsProperty(targetType.resolve(Object.class));
+            }
+        }
+
+		@Override
+		public Object getTarget() {
+			return null;
+		}
+
+		@Override
+		protected Object getActualFieldValue(String field) {
+			return null;
+		}
+
+		public void rejectValue(@Nullable Object rawValue, String code, String defaultMessage) {
+			addError(new FieldError(
+					getObjectName(), fixedField(null), rawValue, true, resolveMessageCodes(code),
+					null, defaultMessage));
+		}
 	}
 
 }
