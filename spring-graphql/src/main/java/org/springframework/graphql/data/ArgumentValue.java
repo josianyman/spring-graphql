@@ -16,10 +16,10 @@
 package org.springframework.graphql.data;
 
 
-import java.util.Optional;
-
 import org.springframework.lang.Nullable;
 import org.springframework.util.ObjectUtils;
+
+import java.util.Optional;
 
 /**
  * Simple container for the value from binding a GraphQL argument to a higher
@@ -46,7 +46,7 @@ import org.springframework.util.ObjectUtils;
  */
 public final class ArgumentValue<T> {
 
-	private static final ArgumentValue<?> OMITTED = new ArgumentValue<>(null, false);
+	private static final ArgumentValue<?> OMITTED = new ArgumentValue<>(null, true);
 
 
 	@Nullable
@@ -92,17 +92,17 @@ public final class ArgumentValue<T> {
 		return Optional.ofNullable(this.value);
 	}
 
-	@Override
-	public boolean equals(Object other) {
-		// This covers OMITTED constant
-		if (this == other) {
-			return true;
-		}
-		if (!(other instanceof ArgumentValue<?> otherValue)) {
-			return false;
-		}
-		return ObjectUtils.nullSafeEquals(this.value, otherValue.value);
-	}
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof ArgumentValue)) {
+            return false;
+        }
+        ArgumentValue<?> otherValue = (ArgumentValue<?>) other;
+        return ObjectUtils.nullSafeEquals(this.value, otherValue.value);
+    }
 
 	@Override
 	public int hashCode() {
